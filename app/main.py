@@ -140,8 +140,8 @@ def queue_post(message: Message):
 
 @dp.my_chat_member()
 async def detect_bot_channel_membership(update: ChatMemberUpdated):
-    if update.chat.type != "channel":
-        return
+    if update.chat.type != "channel" or storage.is_source(update.chat.id):
+        return  # the source channel is never a destination
     new_status = status_of(update.new_chat_member)
     title = update.chat.title or str(update.chat.id)
     can_post = getattr(update.new_chat_member, "can_post_messages", None)
@@ -273,6 +273,8 @@ async def add_channel_cmd(message: Message):
         chat = await bot.get_chat(target)
         if chat.type != "channel":
             return await message.answer("That is not a channel.")
+        if storage.is_source(chat.id):
+            return await message.answer("That is your SOURCE channel. Posts are collected from it, never sent to it.")
         me = await bot.get_chat_member(chat.id, (await bot.get_me()).id)
     except TelegramAPIError:
         return await message.answer(
@@ -422,6 +424,9 @@ async def capture_admin_direct_post(message: Message):
 
 async def process_channel(channel):
     channel_id = int(channel["chat_id"])
+    if storage.is_source(channel_id):
+        await db(storage.remove_channel, channel_id)
+        return
     interval = int(channel["interval_minutes"])
     sent = 0
 
@@ -498,6 +503,9 @@ async def scheduler():
 
 async def main():
     await db(storage.init_db)
+    if SOURCE_CHANNEL_ID:
+        # Clean up: an earlier version may have registered the source channel as a destination.
+        await db(storage.remove_channel, SOURCE_CHANNEL_ID)
     if not ADMIN_IDS:
         logging.warning("ADMIN_IDS is empty: nobody can use admin commands.")
     if not SOURCE_CHANNEL_ID:

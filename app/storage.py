@@ -4,7 +4,12 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from .config import DATABASE_PATH, DEFAULT_INTERVAL_MINUTES
+from .config import DATABASE_PATH, DEFAULT_INTERVAL_MINUTES, SOURCE_CHANNEL_ID
+
+
+def is_source(chat_id) -> bool:
+    """The source channel is where posts are collected from; it must never be a destination."""
+    return bool(SOURCE_CHANNEL_ID) and int(chat_id) == SOURCE_CHANNEL_ID
 
 
 def _now() -> str:
@@ -74,6 +79,8 @@ def init_db():
 # ---------------------------------------------------------------- channels
 
 def register_channel_if_missing(chat_id: int, title: str):
+    if is_source(chat_id):
+        return
     with connection() as db:
         db.execute(
             "INSERT OR IGNORE INTO channels(chat_id,title,interval_minutes,next_run) VALUES(?,?,?,?)",
@@ -82,6 +89,8 @@ def register_channel_if_missing(chat_id: int, title: str):
 
 
 def add_channel(chat_id: int, title: str, interval_minutes: int):
+    if is_source(chat_id):
+        return
     with connection() as db:
         db.execute(
             """INSERT INTO channels(chat_id,title,interval_minutes,next_run) VALUES(?,?,?,?)
@@ -106,7 +115,8 @@ def list_channels():
     with connection() as db:
         return db.execute(
             """SELECT c.*, (SELECT COUNT(*) FROM channel_queue cq WHERE cq.channel_id=c.chat_id) AS pending
-               FROM channels c ORDER BY c.title"""
+               FROM channels c WHERE c.chat_id<>? ORDER BY c.title""",
+            (SOURCE_CHANNEL_ID,),
         ).fetchall()
 
 
@@ -229,8 +239,9 @@ def finish_channel_post(channel_id: int, queue_id: int):
 def next_due_channel(now_iso: str):
     with connection() as db:
         return db.execute(
-            "SELECT * FROM channels WHERE next_run IS NULL OR next_run<=? ORDER BY COALESCE(next_run,'') LIMIT 1",
-            (now_iso,),
+            "SELECT * FROM channels WHERE chat_id<>? AND (next_run IS NULL OR next_run<=?) "
+            "ORDER BY COALESCE(next_run,'') LIMIT 1",
+            (SOURCE_CHANNEL_ID, now_iso),
         ).fetchone()
 
 
