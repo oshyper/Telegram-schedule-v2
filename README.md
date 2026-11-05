@@ -23,6 +23,8 @@ Saves every post from one source channel into a library and copies posts to your
 | `QUIET_START_HOUR` / `QUIET_END_HOUR` | `0` / `7` | No sending from 00:00 until 07:00 (set both equal to disable) |
 
 ## Adding and removing channels
+The source channel (`SOURCE_CHANNEL_ID`) is never treated as a destination: the bot only collects posts from it and never posts there, even though it is admin in it.
+
 - **Add (easiest):** make the bot admin in the channel with *Post messages* permission. It registers itself and messages the admins.
 - **Add by command:** `/addchannel -1001234567890` or `/addchannel @channelname` (optional minutes at the end, default 200). The bot checks that it really is admin there.
 - **Remove:** send `/removechannel`, tap the channel, confirm. Or `/removechannel CHAT_ID`.
