@@ -22,19 +22,27 @@ Saves every post from one source channel into a library and copies posts to your
 | `TIMEZONE` | `Asia/Kolkata` | Timezone for quiet hours |
 | `QUIET_START_HOUR` / `QUIET_END_HOUR` | `0` / `7` | No sending from 00:00 until 07:00 (set both equal to disable) |
 
-## Adding and removing channels
-The source channel (`SOURCE_CHANNEL_ID`) is never treated as a destination: the bot only collects posts from it and never posts there, even though it is admin in it.
+## Destinations: channels AND groups
+The source channel (`SOURCE_CHANNEL_ID`) is never a destination: the bot only collects posts from it.
+Posts can go to channels, groups and supergroups (including a specific **topic** of a forum group).
 
-- **Add (easiest):** make the bot admin in the channel with *Post messages* permission. It registers itself and messages the admins.
-- **Add by command:** `/addchannel -1001234567890` or `/addchannel @channelname` (optional minutes at the end, default 200). The bot checks that it really is admin there.
-- **Remove:** send `/removechannel`, tap the channel, confirm. Or `/removechannel CHAT_ID`.
-- **Automatic removal:** if the bot is removed from a channel, demoted, or loses the *Post messages* permission, the channel is removed immediately. The bot sends **no retries** and the admins get one notice. Add the bot back as admin to resume.
+**Add**
+- **Easiest:** add the bot with an account listed in `ADMIN_IDS` — channel: as admin with *Post messages*; group: as a member. It registers itself and messages the admins. (If someone else adds the bot, it is ignored, so strangers cannot make it post in their groups.)
+- **Inside a group/topic:** send `/addhere` (optional minutes). Posts go to that topic. If the command is not delivered, use `/addhere@YourBotUsername` or make the bot admin.
+- **By ID/username:** `/addchannel -1001234567890`, `/addchannel @name`, optional minutes and `topic=ID` (e.g. `/addchannel -1001234567890 200 topic=7`).
 
-## Other admin commands
-- `/channels` — destinations, interval, pending posts, next run (local time)
-- `/setinterval CHAT_ID | MINUTES` — change a channel's interval
-- `/setinterval all | 200` — same interval for every channel
-- Reply to a post with `/broadcast` — send it to all destinations immediately
+**Remove**
+- `/removechannel` -> tap the chat -> confirm, or `/removehere` inside a group, or `/removechannel CHAT_ID`.
+- **Automatic:** if the bot is removed, demoted, loses the permission to post, or the chat/topic is gone, the destination is removed immediately. No retries; the admins get one notice. A group upgraded to a supergroup keeps its schedule (ID is moved automatically).
+
+## Manage
+- `/channels` — all destinations, interval, batch size, pending posts, next run
+- `/setinterval CHAT_ID|all | MINUTES` — wait between batches
+- `/setbatch CHAT_ID|all | POSTS` — posts per batch (default `BATCH_SIZE`)
+- `/pause` / `/resume` `CHAT_ID|all` — stop/restart a destination without removing it
+- `/sendnow CHAT_ID|all` — start a batch right away (quiet hours still apply)
+- Reply to a post with `/broadcast` — send it to every destination now
+In a group, `/pause`, `/resume`, `/sendnow`, `/setinterval 200` and `/setbatch 3` work without an ID.
 
 ## How posting works
 1. A new source post is given to **one** destination (true round-robin).
@@ -47,4 +55,5 @@ The source channel (`SOURCE_CHANNEL_ID`) is never treated as a destination: the 
 - Albums are handled as separate messages, not as grouped albums.
 - Edited source posts are not re-synced.
 - Protected content cannot be copied.
+- One destination per chat (a forum group can target one topic).
 - Never commit bot tokens; use Railway Variables.
