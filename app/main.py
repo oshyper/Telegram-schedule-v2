@@ -15,6 +15,7 @@ from aiogram.exceptions import (
     TelegramAPIError,
     TelegramBadRequest,
     TelegramForbiddenError,
+    TelegramMigrateToChat,
     TelegramRetryAfter,
 )
 from aiogram.client.default import DefaultBotProperties
@@ -35,6 +36,9 @@ if not BOT_TOKEN:
 TZ = ZoneInfo(TIMEZONE)
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+DEST_TYPES = {"channel", "group", "supergroup"}
+GROUP_TYPES = {"group", "supergroup"}
 
 
 # ------------------------------------------------------------------ helpers
@@ -76,11 +80,29 @@ def status_of(member) -> str:
     return str(getattr(member.status, "value", member.status))
 
 
+def icon(kind: str) -> str:
+    return "📢" if kind == "channel" else "👥"
+
+
+def bot_can_post(chat_type: str, member) -> bool:
+    """Can the bot post in this chat, judging by its own membership record?"""
+    status = status_of(member)
+    if chat_type == "channel":
+        return status in {"administrator", "creator"} and getattr(member, "can_post_messages", None) is not False
+    if status in {"administrator", "creator", "member"}:
+        return True
+    if status == "restricted":
+        return bool(getattr(member, "can_send_messages", False))
+    return False
+
+
 def is_admin(message: Message) -> bool:
     return bool(message.from_user and message.from_user.id in ADMIN_IDS)
 
 
 async def deny(message: Message):
+    if message.chat.type != "private":
+        return  # stay silent in groups
     uid = message.from_user.id if message.from_user else "?"
     await message.answer(f"Not authorized. Your Telegram user ID: <code>{uid}</code>")
 
@@ -93,9 +115,11 @@ async def notify_admins(text: str):
             logging.warning("Could not notify admin %s; they may need to start the bot first.", admin_id)
 
 
+# Errors that mean "the bot can no longer post in this chat" -> remove it, never retry.
 LOST_ACCESS_HINTS = (
-    "not enough rights", "have no rights", "need administrator rights", "chat_write_forbidden",
-    "chat not found", "bot is not a member", "bot was kicked", "channel_private",
+    "not enough rights to send text", "have no rights to send a message", "need administrator rights",
+    "chat_write_forbidden", "chat not found", "bot is not a member", "bot was kicked",
+    "channel_private", "chat was deleted", "group chat was deleted",
 )
 
 
@@ -104,17 +128,17 @@ def lost_access(exc: Exception) -> bool:
     return any(hint in text for hint in LOST_ACCESS_HINTS)
 
 
-async def drop_channel(channel_id: int, title: str, reason: str):
-    """Remove a channel completely (no more scheduling, no retries) and tell the admins once."""
-    await db(storage.remove_channel, channel_id)
-    logging.warning("Channel %s (%s) removed: %s", channel_id, title, reason)
+async def drop_channel(chat_id: int, title: str, reason: str):
+    """Remove a destination completely (no more scheduling, no retries) and tell the admins once."""
+    await db(storage.remove_channel, chat_id)
+    logging.warning("Destination %s (%s) removed: %s", chat_id, title, reason)
     await notify_admins(
-        "<b>Channel removed automatically</b>\n\n"
-        f"<b>Channel:</b> {escape(title)}\n"
-        f"<b>ID:</b> <code>{channel_id}</code>\n"
+        "<b>Destination removed automatically</b>\n\n"
+        f"<b>Chat:</b> {escape(title)}\n"
+        f"<b>ID:</b> <code>{chat_id}</code>\n"
         f"<b>Reason:</b> {escape(reason)}\n\n"
-        "The bot will not post or retry there. To use it again, add the bot back as admin "
-        "with 'Post messages' permission — it registers automatically."
+        "The bot will not post or retry there. To use it again, add the bot back with permission "
+        "to post (channel: admin with 'Post messages')."
     )
 
 
@@ -136,35 +160,59 @@ def queue_post(message: Message):
     )
 
 
-# ------------------------------------------------------- channel registration
+def parse_target(raw: str):
+    """'all' -> 'all', number -> int, anything else -> ValueError."""
+    raw = raw.strip()
+    return "all" if raw.lower() == "all" else int(raw)
+
+
+def target_from(message: Message, raw: str):
+    """Target from the command argument; inside a group the chat itself is the default."""
+    if raw.strip():
+        return parse_target(raw)
+    if message.chat.type in GROUP_TYPES:
+        return message.chat.id
+    raise ValueError
+
+
+# --------------------------------------------- bot added to / removed from chats
 
 @dp.my_chat_member()
-async def detect_bot_channel_membership(update: ChatMemberUpdated):
-    if update.chat.type != "channel" or storage.is_source(update.chat.id):
-        return  # the source channel is never a destination
-    new_status = status_of(update.new_chat_member)
-    title = update.chat.title or str(update.chat.id)
-    can_post = getattr(update.new_chat_member, "can_post_messages", None)
+async def detect_bot_membership(update: ChatMemberUpdated):
+    chat = update.chat
+    if chat.type not in DEST_TYPES or storage.is_source(chat.id):
+        return  # private chats and the source channel are never destinations
+    title = chat.title or str(chat.id)
+    registered = any(int(c["chat_id"]) == chat.id for c in await db(storage.list_channels))
 
-    # Bot removed, demoted from admin, or lost the 'Post messages' permission -> forget the channel.
-    if new_status in {"left", "kicked", "member", "restricted"} or (new_status == "administrator" and can_post is False):
-        if any(int(c["chat_id"]) == update.chat.id for c in await db(storage.list_channels)):
-            await drop_channel(update.chat.id, title, "bot was removed or lost the 'Post messages' permission")
+    if not bot_can_post(chat.type, update.new_chat_member):
+        if registered:
+            await drop_channel(chat.id, title, "bot was removed or can no longer post there")
+        return
+    if registered:
+        return  # some other permission changed; nothing to do
+
+    adder = update.from_user.id if update.from_user else None
+    if adder not in ADMIN_IDS:
+        logging.info("Bot added to %s (%s) by a non-admin; ignored.", chat.id, title)
         return
 
-    # Bot became admin with posting rights -> register automatically (once).
-    if new_status == "administrator":
-        if any(int(c["chat_id"]) == update.chat.id for c in await db(storage.list_channels)):
-            return  # already registered; some other admin right changed
-        await db(storage.register_channel_if_missing, update.chat.id, title)
-        logging.info("Registered destination channel %s (%s)", update.chat.id, title)
-        await notify_admins(
-            "<b>Channel added</b>\n\n"
-            f"<b>Channel:</b> {escape(title)}\n"
-            f"<b>ID:</b> <code>{update.chat.id}</code>\n"
-            f"<b>Batch:</b> up to {BATCH_SIZE} posts, then every {DEFAULT_INTERVAL_MINUTES} minutes\n\n"
-            "Nothing else to do. Use /channels to see it or /removechannel to remove it."
-        )
+    await db(storage.register_channel_if_missing, chat.id, title, chat.type)
+    logging.info("Registered destination %s (%s, %s)", chat.id, title, chat.type)
+    await notify_admins(
+        f"<b>{'Channel' if chat.type == 'channel' else 'Group'} added</b>\n\n"
+        f"<b>Name:</b> {escape(title)}\n"
+        f"<b>ID:</b> <code>{chat.id}</code>\n"
+        f"<b>Batch:</b> up to {BATCH_SIZE} posts, then every {DEFAULT_INTERVAL_MINUTES} minutes\n\n"
+        "Nothing else to do. Use /channels to see it or /removechannel to remove it."
+    )
+
+
+@dp.message(F.migrate_to_chat_id)
+async def group_upgraded(message: Message):
+    """Telegram gave an upgraded group a new chat ID; keep its schedule."""
+    await db(storage.migrate_channel, message.chat.id, message.migrate_to_chat_id)
+    logging.info("Group %s upgraded to %s", message.chat.id, message.migrate_to_chat_id)
 
 
 # ------------------------------------------------------------------ commands
@@ -172,25 +220,28 @@ async def detect_bot_channel_membership(update: ChatMemberUpdated):
 def help_text() -> str:
     return (
         "<b>Auto Forward Scheduler — Help</b>\n\n"
-        "<b>Add a channel (easiest)</b>\n"
-        "Make the bot admin in the channel with 'Post messages' permission. Done — it registers itself.\n"
-        "Or: <code>/addchannel -1001234567890</code> or <code>/addchannel @channelname</code> "
-        "(optional minutes at the end, default "
-        f"{DEFAULT_INTERVAL_MINUTES}).\n\n"
-        "<b>Remove a channel</b>\n"
-        "Send /removechannel and tap the channel. Or just remove the bot from the channel — "
+        "<b>Add a channel or group</b>\n"
+        "• Add the bot yourself (admin account) — channel: as admin with 'Post messages'; "
+        "group: as a member. It registers itself.\n"
+        "• Or in a group/topic send <code>/addhere</code> (posts go to that topic).\n"
+        "• Or here: <code>/addchannel -1001234567890</code> or <code>/addchannel @name</code> "
+        f"(optional: minutes, <code>topic=ID</code>; default {DEFAULT_INTERVAL_MINUTES} min).\n\n"
+        "<b>Remove</b>\n"
+        "/removechannel and tap the chat, or /removehere inside a group, or just remove the bot — "
         "it stops posting there automatically.\n\n"
-        "<b>Other commands</b>\n"
-        "/channels — channels, queue and next run\n"
-        "/setinterval CHAT_ID | MINUTES — wait between batches\n"
-        "/setinterval all | MINUTES — same for every channel\n"
-        "/broadcast — reply to a post to send it to all channels now\n\n"
+        "<b>Manage</b>\n"
+        "/channels — destinations, queue, next run\n"
+        "/setinterval CHAT_ID|all | MINUTES\n"
+        "/setbatch CHAT_ID|all | POSTS — posts per batch\n"
+        "/pause and /resume CHAT_ID|all\n"
+        "/sendnow CHAT_ID|all — start a batch now\n"
+        "/broadcast — reply to a post to send it everywhere now\n\n"
         "<b>How it works</b>\n"
-        f"• Each channel sends up to {BATCH_SIZE} posts, then waits its interval.\n"
-        "• New source posts go to one channel (round-robin).\n"
+        f"• Each destination sends up to {BATCH_SIZE} posts, then waits its interval.\n"
+        "• New source posts go to one destination (round-robin).\n"
         "• When a queue is empty, random posts are sent without repeats until all were sent once.\n"
         f"• Quiet hours (no sending): {quiet_label()}.\n"
-        "• If the bot loses access to a channel, that channel is removed — no retries."
+        "• Lost access = destination removed, no retries."
     )
 
 
@@ -215,34 +266,40 @@ async def direct_broadcast(message: Message):
         return
     channels = await db(storage.list_channels)
     if not channels:
-        await message.answer("No destination channels registered. Add the bot as admin to a channel.")
+        await message.answer("No destinations registered.")
         return
+
+    async def send(channel):
+        kwargs = {"chat_id": int(channel["chat_id"]), "from_chat_id": message.chat.id, "message_id": target.message_id}
+        if channel["thread_id"]:
+            kwargs["message_thread_id"] = channel["thread_id"]
+        await bot.copy_message(**kwargs)
 
     succeeded, failed = [], []
     for channel in channels:
-        channel_id = int(channel["chat_id"])
+        chat_id = int(channel["chat_id"])
         try:
-            await bot.copy_message(chat_id=channel_id, from_chat_id=message.chat.id, message_id=target.message_id)
-            succeeded.append(channel_id)
+            await send(channel)
+            succeeded.append(chat_id)
         except TelegramForbiddenError:
-            await drop_channel(channel_id, channel["title"], "bot has no access to post there")
-            failed.append(channel_id)
+            await drop_channel(chat_id, channel["title"], "bot has no access to post there")
+            failed.append(chat_id)
         except TelegramRetryAfter as exc:
             await asyncio.sleep(int(exc.retry_after) + 1)
             try:
-                await bot.copy_message(chat_id=channel_id, from_chat_id=message.chat.id, message_id=target.message_id)
-                succeeded.append(channel_id)
+                await send(channel)
+                succeeded.append(chat_id)
             except TelegramAPIError:
-                logging.exception("Direct broadcast failed for channel %s", channel_id)
-                failed.append(channel_id)
+                logging.exception("Direct broadcast failed for %s", chat_id)
+                failed.append(chat_id)
         except TelegramAPIError:
-            logging.exception("Direct broadcast failed for channel %s", channel_id)
-            failed.append(channel_id)
+            logging.exception("Direct broadcast failed for %s", chat_id)
+            failed.append(chat_id)
         await asyncio.sleep(0.5)
 
-    summary = f"Direct broadcast: sent to {len(succeeded)}/{len(channels)} channel(s)."
+    summary = f"Direct broadcast: sent to {len(succeeded)}/{len(channels)} destination(s)."
     if failed:
-        summary += "\nFailed channel IDs: " + ", ".join(str(c) for c in failed)
+        summary += "\nFailed IDs: " + ", ".join(str(c) for c in failed)
     await message.answer(summary)
 
 
@@ -254,41 +311,71 @@ async def add_channel_cmd(message: Message):
     tokens = [t for t in re.split(r"[|\s]+", args) if t]
     if not tokens:
         return await message.answer(
-            "Format: <code>/addchannel -1001234567890</code> or <code>/addchannel @channelname</code>\n"
-            f"Optional minutes at the end (default {DEFAULT_INTERVAL_MINUTES}). "
-            "The bot must already be admin in that channel."
+            "Format: <code>/addchannel -1001234567890</code> or <code>/addchannel @name</code>\n"
+            f"Optional at the end: minutes (default {DEFAULT_INTERVAL_MINUTES}) and <code>topic=ID</code> "
+            "for a group topic. The bot must already be in that chat."
         )
-    interval = DEFAULT_INTERVAL_MINUTES
-    if len(tokens) > 1 and tokens[-1].isdigit():
-        interval = max(1, int(tokens[-1]))
+    interval, thread_id = DEFAULT_INTERVAL_MINUTES, None
+    for token in tokens[1:]:
+        topic = re.fullmatch(r"topic[=:]?(\d+)", token.lower())
+        if topic:
+            thread_id = int(topic.group(1))
+        elif token.isdigit():
+            interval = max(1, int(token))
     ref = tokens[0]
     target = ref if ref.startswith("@") else None
     if target is None:
         try:
             target = int(ref)
         except ValueError:
-            return await message.answer("Send a numeric channel ID (starts with -100) or an @username.")
+            return await message.answer("Send a numeric chat ID (like -100...) or an @username.")
 
     try:
         chat = await bot.get_chat(target)
-        if chat.type != "channel":
-            return await message.answer("That is not a channel.")
+        if chat.type not in DEST_TYPES:
+            return await message.answer("That is not a channel or group.")
         if storage.is_source(chat.id):
             return await message.answer("That is your SOURCE channel. Posts are collected from it, never sent to it.")
         me = await bot.get_chat_member(chat.id, (await bot.get_me()).id)
     except TelegramAPIError:
-        return await message.answer(
-            "I cannot access that channel. Add the bot as admin there (with 'Post messages') and try again."
-        )
-    if status_of(me) != "administrator" or getattr(me, "can_post_messages", None) is False:
-        return await message.answer("The bot is in the channel but is not admin with 'Post messages' permission.")
+        return await message.answer("I cannot access that chat. Add the bot there first, then try again.")
+    if not bot_can_post(chat.type, me):
+        return await message.answer("The bot is there but cannot post. Channel: make it admin with 'Post messages'.")
 
     title = chat.title or str(chat.id)
-    await db(storage.add_channel, chat.id, title, interval)
+    await db(storage.add_channel, chat.id, title, interval, chat.type, thread_id)
+    topic_note = f", topic {thread_id}" if thread_id else ""
     await message.answer(
-        f"Added <b>{escape(title)}</b> (<code>{chat.id}</code>): up to {BATCH_SIZE} posts per batch, "
-        f"then every {interval} minute(s)."
+        f"Added {icon(chat.type)} <b>{escape(title)}</b> (<code>{chat.id}</code>{topic_note}): "
+        f"up to {BATCH_SIZE} posts per batch, then every {interval} minute(s)."
     )
+
+
+@dp.message(Command("addhere"), F.chat.type.in_(GROUP_TYPES))
+async def add_here_cmd(message: Message):
+    if not is_admin(message):
+        return await deny(message)
+    args = (message.text or "").partition(" ")[2].split()
+    interval = max(1, int(args[0])) if args and args[0].isdigit() else DEFAULT_INTERVAL_MINUTES
+    chat = message.chat
+    try:
+        me = await bot.get_chat_member(chat.id, (await bot.get_me()).id)
+    except TelegramAPIError:
+        return await message.answer("I cannot check my permissions here.")
+    if not bot_can_post(chat.type, me):
+        return await message.answer("I do not have permission to send messages here. Fix that and try again.")
+    thread_id = message.message_thread_id if message.is_topic_message else None
+    await db(storage.add_channel, chat.id, chat.title or str(chat.id), interval, chat.type, thread_id)
+    where = f"this topic (#{thread_id})" if thread_id else "this group"
+    await message.answer(f"Added: posts will go to {where}, up to {BATCH_SIZE} per batch, every {interval} minute(s).")
+
+
+@dp.message(Command("removehere"), F.chat.type.in_(GROUP_TYPES))
+async def remove_here_cmd(message: Message):
+    if not is_admin(message):
+        return await deny(message)
+    await db(storage.remove_channel, message.chat.id)
+    await message.answer("Removed. No more scheduled posts here.")
 
 
 @dp.message(Command("setinterval"))
@@ -296,23 +383,60 @@ async def set_interval_cmd(message: Message):
     if not is_admin(message):
         return await deny(message)
     parts = [p.strip() for p in (message.text or "").partition(" ")[2].split("|")]
-    if len(parts) != 2:
-        return await message.answer("Format: /setinterval CHAT_ID | MINUTES   (or: /setinterval all | MINUTES)")
     try:
-        interval = int(parts[1])
-        if interval < 1:
+        if len(parts) == 2:
+            target, minutes = parse_target(parts[0]), int(parts[1])
+        elif len(parts) == 1 and parts[0].isdigit() and message.chat.type in GROUP_TYPES:
+            target, minutes = message.chat.id, int(parts[0])
+        else:
             raise ValueError
-        target_all = parts[0].lower() == "all"
-        chat_id = None if target_all else int(parts[0])
+        if minutes < 1:
+            raise ValueError
     except ValueError:
-        return await message.answer("CHAT_ID must be numeric (or 'all') and MINUTES must be at least 1.")
+        return await message.answer("Format: /setinterval CHAT_ID | MINUTES   (or: /setinterval all | MINUTES)")
+    count = await db(storage.set_interval, target, minutes)
+    await message.answer(f"Updated {count} destination(s): next batches wait {minutes} minute(s)." if count
+                         else "Destination not found. Check /channels.")
 
-    if target_all:
-        count = await db(storage.set_all_intervals, interval)
-        return await message.answer(f"Updated {count} channel(s): next batches wait {interval} minute(s).")
-    if not await db(storage.set_channel_interval, chat_id, interval):
-        return await message.answer("Channel not found. Make the bot admin there first, or use /addchannel.")
-    await message.answer(f"Updated <code>{chat_id}</code>: next batches will wait {interval} minute(s).")
+
+@dp.message(Command("setbatch"))
+async def set_batch_cmd(message: Message):
+    if not is_admin(message):
+        return await deny(message)
+    parts = [p.strip() for p in (message.text or "").partition(" ")[2].split("|")]
+    try:
+        if len(parts) == 2:
+            target, size = parse_target(parts[0]), int(parts[1])
+        elif len(parts) == 1 and parts[0].isdigit() and message.chat.type in GROUP_TYPES:
+            target, size = message.chat.id, int(parts[0])
+        else:
+            raise ValueError
+        if size < 1:
+            raise ValueError
+    except ValueError:
+        return await message.answer("Format: /setbatch CHAT_ID | POSTS   (or: /setbatch all | POSTS)")
+    count = await db(storage.set_batch_size, target, size)
+    await message.answer(f"Updated {count} destination(s): {size} post(s) per batch." if count
+                         else "Destination not found. Check /channels.")
+
+
+def _simple_target_command(name: str, action, done: str):
+    @dp.message(Command(name))
+    async def handler(message: Message):
+        if not is_admin(message):
+            return await deny(message)
+        try:
+            target = target_from(message, (message.text or "").partition(" ")[2])
+        except ValueError:
+            return await message.answer(f"Format: /{name} CHAT_ID   (or: /{name} all)")
+        count = await db(action, target)
+        await message.answer(f"{done}: {count} destination(s)." if count else "Destination not found. Check /channels.")
+    return handler
+
+
+_simple_target_command("pause", lambda t: storage.set_paused(t, True), "Paused")
+_simple_target_command("resume", lambda t: storage.set_paused(t, False), "Resumed")
+_simple_target_command("sendnow", storage.send_now, "Batch scheduled now (quiet hours still apply)")
 
 
 @dp.message(Command("channels"))
@@ -322,14 +446,22 @@ async def channels_cmd(message: Message):
     channels = await db(storage.list_channels)
     library = await db(storage.library_size)
     if not channels:
-        return await message.answer("No destination channels registered. Add the bot as admin to a channel.")
-    lines = [
-        f"<code>{c['chat_id']}</code> — {escape(c['title'])}\n"
-        f"   every {c['interval_minutes']} min · pending {c['pending']} · next {fmt_local(c['next_run'])}"
-        for c in channels
-    ]
+        return await message.answer("No destinations registered. Add the bot to a channel or group.")
+    lines = []
+    for c in channels:
+        extras = []
+        if c["paused"]:
+            extras.append("⏸ paused")
+        if c["thread_id"]:
+            extras.append(f"topic {c['thread_id']}")
+        lines.append(
+            f"{icon(c['kind'])} <b>{escape(c['title'])}</b> <code>{c['chat_id']}</code>"
+            + (f" ({', '.join(extras)})" if extras else "")
+            + f"\n   every {c['interval_minutes']} min · batch {c['batch_size'] or BATCH_SIZE} · "
+              f"pending {c['pending']} · next {fmt_local(c['next_run'])}"
+        )
     await message.answer(
-        f"<b>Destination channels</b>\nLibrary: {library} post(s) · batch up to {BATCH_SIZE}\n"
+        f"<b>Destinations</b> ({len(channels)})\nLibrary: {library} post(s)\n"
         f"Quiet hours: {quiet_label()}\n\n" + "\n".join(lines)
     )
 
@@ -343,15 +475,18 @@ async def remove_channel_cmd(message: Message):
         try:
             chat_id = int(args)
         except ValueError:
-            return await message.answer("Send /removechannel alone and tap a channel, or /removechannel CHAT_ID.")
+            return await message.answer("Send /removechannel alone and tap a chat, or /removechannel CHAT_ID.")
         await db(storage.remove_channel, chat_id)
         return await message.answer(f"Removed <code>{chat_id}</code>. No more posts will be sent there.")
 
     channels = await db(storage.list_channels)
     if not channels:
-        return await message.answer("No channels registered.")
-    rows = [[InlineKeyboardButton(text=f"🗑 {c['title'][:40]}", callback_data=f"rm:{c['chat_id']}")] for c in channels]
-    await message.answer("Tap the channel you want to remove:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return await message.answer("No destinations registered.")
+    rows = [
+        [InlineKeyboardButton(text=f"🗑 {icon(c['kind'])} {c['title'][:36]}", callback_data=f"rm:{c['chat_id']}")]
+        for c in channels
+    ]
+    await message.answer("Tap the one you want to remove:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @dp.callback_query(F.data.startswith("rm"))
@@ -415,7 +550,7 @@ async def capture_admin_direct_post(message: Message):
         return
     qid = await db(queue_post, message)
     if qid:
-        await message.reply("Post saved to the library and queued for one destination channel.")
+        await message.reply("Post saved to the library and queued for one destination.")
     else:
         await message.reply("This post was already saved earlier.")
 
@@ -423,23 +558,27 @@ async def capture_admin_direct_post(message: Message):
 # ----------------------------------------------------------------- scheduler
 
 async def process_channel(channel):
-    channel_id = int(channel["chat_id"])
-    if storage.is_source(channel_id):
-        await db(storage.remove_channel, channel_id)
+    chat_id = int(channel["chat_id"])
+    if storage.is_source(chat_id):
+        await db(storage.remove_channel, chat_id)
         return
     interval = int(channel["interval_minutes"])
+    batch = int(channel["batch_size"] or BATCH_SIZE)
+    thread_id = channel["thread_id"]
     sent = 0
 
-    for _ in range(BATCH_SIZE):
-        post = await db(storage.get_next_post, channel_id)
+    for _ in range(batch):
+        post = await db(storage.get_next_post, chat_id)
         if not post:
             break
 
         kwargs = {
-            "chat_id": channel_id,
+            "chat_id": chat_id,
             "from_chat_id": post["source_chat_id"],
             "message_id": post["message_id"],
         }
+        if thread_id:
+            kwargs["message_thread_id"] = thread_id
         if post["reply_markup_json"]:
             try:
                 kwargs["reply_markup"] = InlineKeyboardMarkup.model_validate_json(post["reply_markup_json"])
@@ -450,11 +589,15 @@ async def process_channel(channel):
             await bot.copy_message(**kwargs)
         except TelegramRetryAfter as exc:
             wait = int(exc.retry_after) + 1
-            logging.warning("Rate limited on channel %s; retrying in %ss", channel_id, wait)
-            await db(storage.postpone_channel, channel_id, utc_in(seconds=wait))
+            logging.warning("Rate limited on %s; retrying in %ss", chat_id, wait)
+            await db(storage.postpone_channel, chat_id, utc_in(seconds=wait))
+            return
+        except TelegramMigrateToChat as exc:
+            await db(storage.migrate_channel, chat_id, int(exc.migrate_to_chat_id))
+            logging.info("Group %s upgraded to %s; schedule moved", chat_id, exc.migrate_to_chat_id)
             return
         except TelegramForbiddenError:
-            await drop_channel(channel_id, channel["title"], "bot lost access or the 'Post messages' permission")
+            await drop_channel(chat_id, channel["title"], "bot lost access or permission to post")
             return
         except TelegramBadRequest as exc:
             text = str(exc).lower()
@@ -463,27 +606,30 @@ async def process_channel(channel):
                 await db(storage.delete_post, post["id"])
                 continue
             if lost_access(exc):
-                await drop_channel(channel_id, channel["title"], "channel not found or bot has no posting rights")
+                await drop_channel(chat_id, channel["title"], "chat not found or bot has no posting rights")
                 return
-            logging.exception("Post %s rejected for channel %s; skipping it", post["id"], channel_id)
-            await db(storage.finish_channel_post, channel_id, post["id"])
+            if "thread not found" in text or ("topic" in text and "closed" in text):
+                await drop_channel(chat_id, channel["title"], "the target topic no longer exists or is closed")
+                return
+            logging.exception("Post %s rejected for %s; skipping it", post["id"], chat_id)
+            await db(storage.finish_channel_post, chat_id, post["id"])
             continue
         except TelegramAPIError:
-            logging.exception("Copy failed for channel %s; retrying in 1 minute", channel_id)
-            await db(storage.postpone_channel, channel_id, utc_in(minutes=1))
+            logging.exception("Copy failed for %s; retrying in 1 minute", chat_id)
+            await db(storage.postpone_channel, chat_id, utc_in(minutes=1))
             return
 
-        await db(storage.finish_channel_post, channel_id, post["id"])
+        await db(storage.finish_channel_post, chat_id, post["id"])
         sent += 1
-        logging.info("Sent post %s/%s to channel %s", sent, BATCH_SIZE, channel_id)
-        if sent < BATCH_SIZE and POST_DELAY_SECONDS:
+        logging.info("Sent post %s/%s to %s", sent, batch, chat_id)
+        if sent < batch and POST_DELAY_SECONDS:
             await asyncio.sleep(POST_DELAY_SECONDS)
 
     if sent:
-        await db(storage.postpone_channel, channel_id, utc_in(minutes=interval))
-        logging.info("Batch done for %s: %s post(s); next in %s min", channel_id, sent, interval)
+        await db(storage.postpone_channel, chat_id, utc_in(minutes=interval))
+        logging.info("Batch done for %s: %s post(s); next in %s min", chat_id, sent, interval)
     else:
-        await db(storage.postpone_channel, channel_id, utc_in(seconds=60))
+        await db(storage.postpone_channel, chat_id, utc_in(seconds=60))
 
 
 async def scheduler():
@@ -504,10 +650,10 @@ async def scheduler():
 async def main():
     await db(storage.init_db)
     if SOURCE_CHANNEL_ID:
-        # Clean up: an earlier version may have registered the source channel as a destination.
+        # An earlier version may have registered the source channel as a destination.
         await db(storage.remove_channel, SOURCE_CHANNEL_ID)
     if not ADMIN_IDS:
-        logging.warning("ADMIN_IDS is empty: nobody can use admin commands.")
+        logging.warning("ADMIN_IDS is empty: nobody can use admin commands or auto-register chats.")
     if not SOURCE_CHANNEL_ID:
         logging.warning("SOURCE_CHANNEL_ID is not configured; source channel posts will be ignored.")
     logging.info(

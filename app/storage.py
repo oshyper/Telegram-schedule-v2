@@ -1,5 +1,4 @@
 import os
-import random
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -46,7 +45,11 @@ def init_db():
             chat_id INTEGER PRIMARY KEY,
             title TEXT NOT NULL,
             interval_minutes INTEGER NOT NULL DEFAULT 200,
-            next_run TEXT
+            next_run TEXT,
+            kind TEXT NOT NULL DEFAULT 'channel',
+            thread_id INTEGER,
+            paused INTEGER NOT NULL DEFAULT 0,
+            batch_size INTEGER
         );
         CREATE TABLE IF NOT EXISTS queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,7 +68,6 @@ def init_db():
             PRIMARY KEY(channel_id, queue_id),
             UNIQUE(channel_id, position)
         );
-        -- Which posts each channel has already sent in its current random cycle.
         CREATE TABLE IF NOT EXISTS channel_sent (
             channel_id INTEGER NOT NULL,
             queue_id INTEGER NOT NULL,
@@ -74,48 +76,73 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
+        # Upgrade databases created by older versions.
+        cols = {r["name"] for r in db.execute("PRAGMA table_info(channels)")}
+        for name, ddl in (
+            ("kind", "TEXT NOT NULL DEFAULT 'channel'"),
+            ("thread_id", "INTEGER"),
+            ("paused", "INTEGER NOT NULL DEFAULT 0"),
+            ("batch_size", "INTEGER"),
+        ):
+            if name not in cols:
+                db.execute(f"ALTER TABLE channels ADD COLUMN {name} {ddl}")
 
 
-# ---------------------------------------------------------------- channels
+# ------------------------------------------------- destinations (channels + groups)
 
-def register_channel_if_missing(chat_id: int, title: str):
+def register_channel_if_missing(chat_id: int, title: str, kind: str = "channel", thread_id=None):
     if is_source(chat_id):
         return
     with connection() as db:
         db.execute(
-            "INSERT OR IGNORE INTO channels(chat_id,title,interval_minutes,next_run) VALUES(?,?,?,?)",
-            (chat_id, title or str(chat_id), DEFAULT_INTERVAL_MINUTES, _now()),
+            "INSERT OR IGNORE INTO channels(chat_id,title,interval_minutes,next_run,kind,thread_id) VALUES(?,?,?,?,?,?)",
+            (chat_id, title or str(chat_id), DEFAULT_INTERVAL_MINUTES, _now(), kind, thread_id),
         )
 
 
-def add_channel(chat_id: int, title: str, interval_minutes: int):
+def add_channel(chat_id: int, title: str, interval_minutes: int, kind: str = "channel", thread_id=None):
     if is_source(chat_id):
         return
     with connection() as db:
         db.execute(
-            """INSERT INTO channels(chat_id,title,interval_minutes,next_run) VALUES(?,?,?,?)
-               ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, interval_minutes=excluded.interval_minutes""",
-            (chat_id, title, interval_minutes, _now()),
+            """INSERT INTO channels(chat_id,title,interval_minutes,next_run,kind,thread_id) VALUES(?,?,?,?,?,?)
+               ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,
+                   interval_minutes=excluded.interval_minutes, kind=excluded.kind, thread_id=excluded.thread_id""",
+            (chat_id, title, interval_minutes, _now(), kind, thread_id),
         )
 
 
-def set_channel_interval(chat_id: int, interval_minutes: int) -> bool:
-    with connection() as db:
-        cur = db.execute("UPDATE channels SET interval_minutes=? WHERE chat_id=?", (interval_minutes, chat_id))
-        return cur.rowcount > 0
+def _update_all_or_one(db, column: str, value, target) -> int:
+    if target == "all":
+        return db.execute(f"UPDATE channels SET {column}=?", (value,)).rowcount
+    return db.execute(f"UPDATE channels SET {column}=? WHERE chat_id=?", (value, int(target))).rowcount
 
 
-def set_all_intervals(interval_minutes: int) -> int:
+def set_interval(target, minutes: int) -> int:
     with connection() as db:
-        cur = db.execute("UPDATE channels SET interval_minutes=?", (interval_minutes,))
-        return cur.rowcount
+        return _update_all_or_one(db, "interval_minutes", minutes, target)
+
+
+def set_batch_size(target, size: int) -> int:
+    with connection() as db:
+        return _update_all_or_one(db, "batch_size", size, target)
+
+
+def set_paused(target, paused: bool) -> int:
+    with connection() as db:
+        return _update_all_or_one(db, "paused", 1 if paused else 0, target)
+
+
+def send_now(target) -> int:
+    with connection() as db:
+        return _update_all_or_one(db, "next_run", _now(), target)
 
 
 def list_channels():
     with connection() as db:
         return db.execute(
             """SELECT c.*, (SELECT COUNT(*) FROM channel_queue cq WHERE cq.channel_id=c.chat_id) AS pending
-               FROM channels c WHERE c.chat_id<>? ORDER BY c.title""",
+               FROM channels c WHERE c.chat_id<>? ORDER BY c.kind, c.title""",
             (SOURCE_CHANNEL_ID,),
         ).fetchall()
 
@@ -132,10 +159,27 @@ def remove_channel(chat_id: int):
         db.execute("DELETE FROM channel_sent WHERE channel_id=?", (chat_id,))
 
 
+def migrate_channel(old_id: int, new_id: int):
+    """A group was upgraded to a supergroup, so Telegram gave it a new chat ID."""
+    with connection() as db:
+        exists = db.execute("SELECT 1 FROM channels WHERE chat_id=?", (new_id,)).fetchone()
+        if exists:
+            db.execute("DELETE FROM channels WHERE chat_id=?", (old_id,))
+            db.execute("DELETE FROM channel_queue WHERE channel_id=?", (old_id,))
+            db.execute("DELETE FROM channel_sent WHERE channel_id=?", (old_id,))
+            return
+        db.execute("UPDATE channels SET chat_id=?, kind='supergroup' WHERE chat_id=?", (new_id, old_id))
+        db.execute("UPDATE channel_queue SET channel_id=? WHERE channel_id=?", (new_id, old_id))
+        db.execute("UPDATE channel_sent SET channel_id=? WHERE channel_id=?", (new_id, old_id))
+
+
 # ------------------------------------------------------------------- posts
 
 def _next_round_robin_channel(db):
-    ids = [int(r["chat_id"]) for r in db.execute("SELECT chat_id FROM channels ORDER BY chat_id")]
+    ids = [
+        int(r["chat_id"])
+        for r in db.execute("SELECT chat_id FROM channels WHERE paused=0 AND chat_id<>? ORDER BY chat_id", (SOURCE_CHANNEL_ID,))
+    ]
     if not ids:
         return None
     row = db.execute("SELECT value FROM settings WHERE key='rr_last'").fetchone()
@@ -156,7 +200,7 @@ def _append_to_channel_queue(db, channel_id: int, queue_id: int):
 
 
 def add_post(source_chat_id: int, message_id: int, caption, entities_json, reply_markup_json):
-    """Save a post in the library and give it to ONE destination channel (round-robin).
+    """Save a post in the library and give it to ONE active destination (round-robin).
     Returns the new queue id, or None if this exact post was already saved."""
     with connection() as db:
         cur = db.execute(
@@ -194,9 +238,9 @@ def _pick_random(db, channel_id: int, exclude_id=None):
 
 
 def get_next_post(channel_id: int):
-    """Next post for a channel.
+    """Next post for a destination.
     1) its own pending queue, in order;
-    2) when empty: a random post that this channel has NOT sent yet in the current cycle;
+    2) when empty: a random post it has NOT sent yet in the current cycle;
     3) when every post has been sent: start a new cycle (never the same post twice in a row)."""
     with connection() as db:
         row = db.execute(
@@ -239,7 +283,7 @@ def finish_channel_post(channel_id: int, queue_id: int):
 def next_due_channel(now_iso: str):
     with connection() as db:
         return db.execute(
-            "SELECT * FROM channels WHERE chat_id<>? AND (next_run IS NULL OR next_run<=?) "
+            "SELECT * FROM channels WHERE paused=0 AND chat_id<>? AND (next_run IS NULL OR next_run<=?) "
             "ORDER BY COALESCE(next_run,'') LIMIT 1",
             (SOURCE_CHANNEL_ID, now_iso),
         ).fetchone()
