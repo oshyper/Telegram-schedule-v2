@@ -22,15 +22,17 @@ Saves every post from one source channel into a library and copies posts to your
 | `TIMEZONE` | `Asia/Kolkata` | Timezone for quiet hours |
 | `QUIET_START_HOUR` / `QUIET_END_HOUR` | `0` / `7` | No sending from 00:00 until 07:00 (set both equal to disable) |
 
-## Admin commands
+## Adding and removing channels
+- **Add (easiest):** make the bot admin in the channel with *Post messages* permission. It registers itself and messages the admins.
+- **Add by command:** `/addchannel -1001234567890` or `/addchannel @channelname` (optional minutes at the end, default 200). The bot checks that it really is admin there.
+- **Remove:** send `/removechannel`, tap the channel, confirm. Or `/removechannel CHAT_ID`.
+- **Automatic removal:** if the bot is removed from a channel, demoted, or loses the *Post messages* permission, the channel is removed immediately. The bot sends **no retries** and the admins get one notice. Add the bot back as admin to resume.
+
+## Other admin commands
 - `/channels` — destinations, interval, pending posts, next run (local time)
 - `/setinterval CHAT_ID | MINUTES` — change a channel's interval
-- `/setinterval all | 200` — set the same interval for every channel
-- `/addchannel CHAT_ID | NAME | MINUTES` — add/update a destination
-- `/removechannel CHAT_ID` — remove a destination
+- `/setinterval all | 200` — same interval for every channel
 - Reply to a post with `/broadcast` — send it to all destinations immediately
-
-Destination channels are auto-registered when the bot becomes admin there, and auto-removed if the bot is removed.
 
 ## How posting works
 1. A new source post is given to **one** destination (true round-robin).
