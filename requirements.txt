@@ -1,2 +1,3 @@
 aiogram>=3.13,<4.0
 tzdata
+Pillow>=10.1
